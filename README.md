@@ -45,8 +45,12 @@ Finally, apply the previously determined postprocessing to the (ensembled) predi
 ```commandline
 nnUNetv2_apply_postprocessing -i FOLDER_WITH_PREDICTIONS -o OUTPUT_FOLDER --pp_pkl_file POSTPROCESSING_FILE -plans_json PLANS_FILE -dataset_json DATASET_JSON_FILE
 ```
-PLOTS:
-python eval_plots.py --pred inference_val_output --labels data/Dataset011_Pancreas/labelsVa --out inference_val_output/figs
+PLOTS
+```shell
+python eval_plots.py --pred inference_val_output --labels nnUNet_raw/Dataset777_3DMedImg/labelsVa --out inference_val_output/figs
+```
+
+---
 
 ---
 ## File Structure
