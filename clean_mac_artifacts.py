@@ -1,14 +1,6 @@
 import sys
 import os
 import shutil
-#if this file is in parent directory, run this in commmand line: 
-    # """ python ../clean_mac_artifacts.py """
-#if its in the same directory, 
-    # # """ python ./clean_mac_artifacts.py """
-    # OR can run this in notebook: """
-    # import clean_mac_artifacts
-    # clean_mac_artifacts.mac_sux('./')
-    # """
 def mac_sux(root_path):
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Delete .DS_Store files
