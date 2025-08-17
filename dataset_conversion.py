@@ -1,197 +1,140 @@
-### Reformating structure of raw data (so that it is nnUNetV2 compatible) ###
-#############################################################################
+# dataset_conversion.py
+# Reformatting structure of raw data (nnUNetV2 compatible)
+# NOW with label sanitization: snaps labels to {0,1,2} and saves as uint8
 
-import shutil
-import nibabel as nib
-import numpy as np
-import json
 from pathlib import Path
-import argparse
+import re
+import json
+import shutil
+import numpy as np
+import nibabel as nib
+from nnunetv2.dataset_conversion.generate_dataset_json import generate_dataset_json
 
+IMG_RE = re.compile(r".*_\d{4}\.nii\.gz$", re.IGNORECASE)
+SUBTYPE_RE = re.compile(r"subtype(\d+)$", re.IGNORECASE)
 
-def organize_data_for_nnunet(merge_validation_with_training=True):
-    base_path = Path('./')
-    dataset_name = 'Dataset777_3DMedImg'
-    nnunet_raw_data_path = base_path / 'nnUNet_raw' / dataset_name
+VALID = np.array([0, 1, 2], dtype=np.float32)  # allowed class ids
+ATOL = 1e-3  # tolerance if there is tiny float noise
 
-    # Create necessary directories
-    if merge_validation_with_training:
-        folders = ['imagesTr', 'labelsTr', 'imagesTs']
-    else:
-        folders = ['imagesTr', 'labelsTr', 'imagesTs', 'imagesVal', 'labelsVal']
-    for folder in folders:
-        (nnunet_raw_data_path / folder).mkdir(parents=True, exist_ok=True)
+def _sanitize_label_file(label_path: Path) -> None:
+    """
+    Load a label NIfTI, snap values to the nearest of {0,1,2}, save as uint8.
+    """
+    img = nib.load(str(label_path))
+    data = img.get_fdata().astype(np.float32)
 
-    # Create dataset.json
-    dataset_json = {
-        "name": "Pancreas",
-        "description": "Pancreas Segmentation Dataset",
-        "tensorImageSize": "3D",
-        "channel_names": {"0": "CT"},
-        "labels": {"background": 0, "pancreas": 1, "lesion": 2},
-        "class_types": {"subtype0": 0, "subtype1": 1, "subtype2": 2},
-        "numTraining": 0,
-        "numValidation": 0,
-        "numTest": 0,
-        "file_ending": ".nii.gz",
-        "training": [],
-        "validation": [],
-        "test": []
-    }
+    # Map each voxel to closest valid label id
+    idx = np.argmin(np.abs(data[..., None] - VALID), axis=-1)
+    fixed = VALID[idx].astype(np.uint8)
 
-    subtype_mapping = {}
+    hdr = img.header.copy()
+    hdr.set_data_dtype(np.uint8)
+    nib.save(nib.Nifti1Image(fixed, img.affine, hdr), str(label_path))
 
-    # Process training data
-    for subtype in ['subtype0', 'subtype1', 'subtype2']:
-        train_path = base_path / 'ML-Quiz-3DMedImg' / 'train' / subtype
-        if train_path.exists():
-            for file in sorted(train_path.glob('*_0000.nii.gz')):
-                case_id = file.stem.split('_0000')[0]
-                mask_file = train_path / f"{case_id}.nii.gz"
+def move_split(src_dir: Path, img_dst: Path, lbl_dst: Path | None, split_name: str,
+               mapping: dict, validation_cases: list):
+    """
+    Move files for a split (train/validation/test).
+    - Images match *_0000.nii.gz style (i.e., _\\d{4}.nii.gz) -> go to img_dst.
+    - Labels are the remaining .nii.gz files -> go to lbl_dst (if provided).
+    Also fills mapping and validation_cases.
+    """
+    if not src_dir.exists():
+        return
 
-                if not mask_file.exists():
-                    print(f"Warning: Mask file not found for training case '{case_id}'. Skipping...")
-                    continue
+    for sub in sorted(p for p in src_dir.iterdir() if p.is_dir()):
+        # Infer subtype from folder name (e.g., 'subtype0', 'subtype1', 'subtype2')
+        m = SUBTYPE_RE.search(sub.name)
+        subtype_id = int(m.group(1)) if m else None
 
-                try:
-                    shutil.copy2(file, nnunet_raw_data_path / 'imagesTr' / file.name)
-
-                    mask = nib.load(mask_file)
-                    mask_data = np.round(mask.get_fdata()).astype(np.uint8)
-                    mask_data = np.clip(mask_data, 0, 2)
-                    new_mask = nib.Nifti1Image(mask_data, mask.affine)
-                    nib.save(new_mask, nnunet_raw_data_path / 'labelsTr' / f"{case_id}.nii.gz")
-
-                    dataset_json["training"].append({
-                        "image": f"./imagesTr/{file.name}",
-                        "label": f"./labelsTr/{case_id}.nii.gz"
-                    })
-
-                    subtype_mapping[case_id] = {
-                        "subtype": int(subtype[-1]),
-                        "split": "train"
-                    }
-
-                except Exception as e:
-                    print(f"Error processing training case '{case_id}': {e}")
-
-    # Process validation data
-    validation_cases = []
-    for subtype in ['subtype0', 'subtype1', 'subtype2']:
-        val_path = base_path / 'ML-Quiz-3DMedImg' / 'validation' / subtype
-        if val_path.exists():
-            for file in sorted(val_path.glob('*_0000.nii.gz')):
-                case_id = file.stem.split('_0000')[0]
-                mask_file = val_path / f"{case_id}.nii.gz"
-
-                if not mask_file.exists():
-                    print(f"Warning: Mask file not found for validation case '{case_id}'. Skipping...")
-                    continue
-
-                try:
-                    if merge_validation_with_training:
-                        # Merge into training
-                        shutil.copy2(file, nnunet_raw_data_path / 'imagesTr' / file.name)
-
-                        mask = nib.load(mask_file)
-                        mask_data = np.round(mask.get_fdata()).astype(np.uint8)
-                        mask_data = np.clip(mask_data, 0, 2)
-                        new_mask = nib.Nifti1Image(mask_data, mask.affine)
-                        nib.save(new_mask, nnunet_raw_data_path / 'labelsTr' / f"{case_id}.nii.gz")
-
-                        dataset_json["training"].append({
-                            "image": f"./imagesTr/{file.name}",
-                            "label": f"./labelsTr/{case_id}.nii.gz"
-                        })
-
-                        subtype_mapping[case_id] = {
-                            "subtype": int(subtype[-1]),
-                            "split": "train"
-                        }
-
-                    else:
-                        # Keep separate
-                        shutil.copy2(file, nnunet_raw_data_path / 'imagesVal' / file.name)
-
-                        mask = nib.load(mask_file)
-                        mask_data = np.round(mask.get_fdata()).astype(np.uint8)
-                        mask_data = np.clip(mask_data, 0, 2)
-                        new_mask = nib.Nifti1Image(mask_data, mask.affine)
-                        nib.save(new_mask, nnunet_raw_data_path / 'labelsVal' / f"{case_id}.nii.gz")
-
-                        dataset_json["validation"].append({
-                            "image": f"./imagesVal/{file.name}",
-                            "label": f"./labelsVal/{case_id}.nii.gz"
-                        })
-
-                        subtype_mapping[case_id] = {
-                            "subtype": int(subtype[-1]),
-                            "split": "validation"
-                        }
-
+        for f in sub.glob("*.nii.gz"):
+            if IMG_RE.match(f.name):
+                # image
+                shutil.move(str(f), img_dst / f.name)
+                # record mapping on images (avoid duplicates from labels)
+                case_id = f.name.split("_0000.nii.gz")[0]
+                mapping[case_id] = {"subtype": subtype_id, "split": split_name}
+                if split_name == "validation":
                     validation_cases.append(case_id)
+            elif lbl_dst is not None:
+                # label -> move then sanitize
+                dst = lbl_dst / f.name
+                shutil.move(str(f), dst)
+                _sanitize_label_file(dst)
 
-                except Exception as e:
-                    print(f"Error processing validation case '{case_id}': {e}")
+def data_converter(base_folder: str, dest_folder: str):
+    base = Path(base_folder)
+    train = base / "train"
+    val   = base / "validation"
+    test  = base / "test"
 
-    # Process test data
-    test_path = base_path / 'ML-Quiz-3DMedImg' / 'test'
-    if test_path.exists():
-        for file in sorted(test_path.glob('*_0000.nii.gz')):
-            try:
-                shutil.copy2(file, nnunet_raw_data_path / 'imagesTs' / file.name)
-                dataset_json["test"].append({"image": f"./imagesTs/{file.name}"})
-            except Exception as e:
-                print(f"Error processing test file '{file}': {e}")
+    dest = Path(dest_folder)
+    imagesTr = dest / "imagesTr"
+    imagesTs = dest / "imagesTs"
+    imagesVa = dest / "imagesVa"
+    labelsTr = dest / "labelsTr"
+    labelsVa = dest / "labelsVa"
 
-    # Update counts
-    dataset_json["numTraining"] = len(dataset_json["training"])
-    dataset_json["numValidation"] = 0 if merge_validation_with_training else len(dataset_json["validation"])
-    dataset_json["numTest"] = len(dataset_json["test"])
+    for d in (imagesTr, imagesTs, imagesVa, labelsTr, labelsVa):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # Save dataset.json
-    with open(nnunet_raw_data_path / 'dataset.json', 'w') as f:
-        json.dump(dataset_json, f, indent=4)
+    # For subtype mapping
+    mapping = {}            # case_id -> {"subtype": int|None, "split": "train"|"validation"|"test"}
+    validation_cases = []   # list of case_ids in validation
 
-    # Save subtype mapping
-    with open(nnunet_raw_data_path / 'subtype_mapping.json', 'w') as f:
-        json.dump({
-            "mapping": subtype_mapping,
-            "validation_cases": validation_cases
-        }, f, indent=4)
+    # Train: move images & labels (labels sanitized)
+    move_split(train, imagesTr, labelsTr, "train", mapping, validation_cases)
 
-    # mode = "MERGED validation with training" if merge_validation_with_training else "KEPT validation separate"
-    # print(f"\nMode: {mode}")
-    # print(f"Training cases: {dataset_json['numTraining']}")
-    # print(f"Validation cases: {dataset_json['numValidation']}")
-    # print(f"Test cases: {dataset_json['numTest']}")
+    # Validation: move images & labels (labels sanitized)
+    move_split(val, imagesVa, labelsVa, "validation", mapping, validation_cases)
 
-    return nnunet_raw_data_path, subtype_mapping
+    # Test: only images (no labels)
+    if test.exists():
+        for f in test.glob("*.nii.gz"):
+            if IMG_RE.match(f.name):
+                shutil.move(str(f), imagesTs / f.name)
+                case_id = f.name.split("_0000.nii.gz")[0]
+                if case_id not in mapping:
+                    mapping[case_id] = {"subtype": None, "split": "test"}
 
+    # Write subtype_mapping.json
+    with open(dest / "subtype_mapping.json", "w") as fh:
+        json.dump(
+            {"mapping": mapping, "validation_cases": validation_cases},
+            fh,
+            indent=2
+        )
+
+    return dest
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Organize data for nnUNet")
-    parser.add_argument(
-        "--mer", action="store_true",
-        help="Merge validation data into training data (default if no flag provided)"
+    base_folder = "ML-Quiz-3DMedImg"
+    dest_folder = "nnUNet_raw/Dataset777_3DMedImg"
+
+    dest = data_converter(base_folder, dest_folder)
+
+    # Auto-counts
+    num_training = len(list((Path(dest) / "labelsTr").glob("*.nii.gz")))
+    print(f"Number of training cases: {num_training}")
+
+    num_test = len(list((Path(dest) / "imagesTs").glob("*.nii.gz")))
+    print(f"Number of test cases: {num_test}")
+
+    num_validation = len(list((Path(dest) / "imagesVa").glob("*.nii.gz")))
+    print(f"Number of validation cases: {num_validation}")
+
+    # NOTE: Using regions for 'pancreas' = union(1,2) is fine. Keep as you had it.
+    generate_dataset_json(
+        str(dest),
+        channel_names={0: "CT"},
+        labels={
+            "background": 0,
+            "pancreas": (1, 2),
+            "lesion": 2,
+        },
+        regions_class_order=(1, 2),
+        num_training_cases=num_training,
+        file_ending=".nii.gz",
+        overwrite_image_reader_writer="SimpleITKIO",
+        converted_by="Hassan Al-Hayawi",
     )
-    parser.add_argument(
-        "--sep", action="store_true",
-        help="Keep validation data separate"
-    )
-    args = parser.parse_args()
-
-    # Default to merge unless --sep is given
-    merge_mode = True if args.mer or not args.sep else False
-
-    nnunet_dataset_path, metadata = organize_data_for_nnunet(merge_mode)
-
-    # # Verify file structure
-    # print("\nVerifying file structure:")
-    # print(f"Training images: {len(list((nnunet_dataset_path / 'imagesTr').glob('*.nii.gz')))}")
-    # print(f"Training labels: {len(list((nnunet_dataset_path / 'labelsTr').glob('*.nii.gz')))}")
-    # if (nnunet_dataset_path / 'imagesVal').exists():
-    #     print(f"Validation images: {len(list((nnunet_dataset_path / 'imagesVal').glob('*.nii.gz')))}")
-    #     print(f"Validation labels: {len(list((nnunet_dataset_path / 'labelsVal').glob('*.nii.gz')))}")
-    # print(f"Test images: {len(list((nnunet_dataset_path / 'imagesTs').glob('*.nii.gz')))}")
-    print ('Files Created') 

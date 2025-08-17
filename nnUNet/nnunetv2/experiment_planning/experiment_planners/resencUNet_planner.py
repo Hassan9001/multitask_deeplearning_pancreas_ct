@@ -9,7 +9,7 @@ from torch import nn
 from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import ExperimentPlanner
 
 from nnunetv2.experiment_planning.experiment_planners.network_topology import get_pool_and_conv_props
-
+from nnunetv2.MultitaskUNet import ResidualEncoderUNetWithClassifier
 
 class ResEncUNetPlanner(ExperimentPlanner):
     def __init__(self, dataset_name_or_id: Union[str, int],
@@ -19,7 +19,7 @@ class ResEncUNetPlanner(ExperimentPlanner):
                  suppress_transpose: bool = False):
         super().__init__(dataset_name_or_id, gpu_memory_target_in_gb, preprocessor_name, plans_name,
                          overwrite_target_spacing, suppress_transpose)
-        self.UNet_class = ResidualEncoderUNet
+        self.UNet_class = ResidualEncoderUNetWithClassifier
         # the following two numbers are really arbitrary and were set to reproduce default nnU-Net's configurations as
         # much as possible
         self.UNet_reference_val_3d = 680000000
@@ -215,21 +215,21 @@ class ResEncUNetPlanner(ExperimentPlanner):
         return plan
 
 
-if __name__ == '__main__':
-    # we know both of these networks run with batch size 2 and 12 on ~8-10GB, respectively
-    net = ResidualEncoderUNet(input_channels=1, n_stages=6, features_per_stage=(32, 64, 128, 256, 320, 320),
-                              conv_op=nn.Conv3d, kernel_sizes=3, strides=(1, 2, 2, 2, 2, 2),
-                              n_blocks_per_stage=(1, 3, 4, 6, 6, 6), num_classes=3,
-                              n_conv_per_stage_decoder=(1, 1, 1, 1, 1),
-                              conv_bias=True, norm_op=nn.InstanceNorm3d, norm_op_kwargs={}, dropout_op=None,
-                              nonlin=nn.LeakyReLU, nonlin_kwargs={'inplace': True}, deep_supervision=True)
-    print(net.compute_conv_feature_map_size((128, 128, 128)))  # -> 558319104. The value you see above was finetuned
-    # from this one to match the regular nnunetplans more closely
+# if __name__ == '__main__':
+#     # we know both of these networks run with batch size 2 and 12 on ~8-10GB, respectively
+#     net = ResidualEncoderUNetWithClassifier(input_channels=1, n_stages=6, features_per_stage=(32, 64, 128, 256, 320, 320),
+#                               conv_op=nn.Conv3d, kernel_sizes=3, strides=(1, 2, 2, 2, 2, 2),
+#                               n_blocks_per_stage=(1, 3, 4, 6, 6, 6), num_classes=3,
+#                               n_conv_per_stage_decoder=(1, 1, 1, 1, 1),
+#                               conv_bias=True, norm_op=nn.InstanceNorm3d, norm_op_kwargs={}, dropout_op=None,
+#                               nonlin=nn.LeakyReLU, nonlin_kwargs={'inplace': True}, deep_supervision=True)
+#     print(net.compute_conv_feature_map_size((128, 128, 128)))  # -> 558319104. The value you see above was finetuned
+#     # from this one to match the regular nnunetplans more closely
 
-    net = ResidualEncoderUNet(input_channels=1, n_stages=7, features_per_stage=(32, 64, 128, 256, 512, 512, 512),
-                              conv_op=nn.Conv2d, kernel_sizes=3, strides=(1, 2, 2, 2, 2, 2, 2),
-                              n_blocks_per_stage=(1, 3, 4, 6, 6, 6, 6), num_classes=3,
-                              n_conv_per_stage_decoder=(1, 1, 1, 1, 1, 1),
-                              conv_bias=True, norm_op=nn.InstanceNorm2d, norm_op_kwargs={}, dropout_op=None,
-                              nonlin=nn.LeakyReLU, nonlin_kwargs={'inplace': True}, deep_supervision=True)
-    print(net.compute_conv_feature_map_size((512, 512)))  # -> 129793792
+#     net = ResidualEncoderUNetWithClassifier(input_channels=1, n_stages=7, features_per_stage=(32, 64, 128, 256, 512, 512, 512),
+#                               conv_op=nn.Conv2d, kernel_sizes=3, strides=(1, 2, 2, 2, 2, 2, 2),
+#                               n_blocks_per_stage=(1, 3, 4, 6, 6, 6, 6), num_classes=3,
+#                               n_conv_per_stage_decoder=(1, 1, 1, 1, 1, 1),
+#                               conv_bias=True, norm_op=nn.InstanceNorm2d, norm_op_kwargs={}, dropout_op=None,
+#                               nonlin=nn.LeakyReLU, nonlin_kwargs={'inplace': True}, deep_supervision=True)
+#     print(net.compute_conv_feature_map_size((512, 512)))  # -> 129793792

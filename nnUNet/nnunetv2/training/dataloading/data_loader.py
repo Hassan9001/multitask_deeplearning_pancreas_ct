@@ -43,7 +43,21 @@ class nnUNetDataLoader(DataLoader):
             self.patch_size_was_2d = False
 
         # this is used by DataLoader for sampling train cases!
-        self.indices = data.identifiers
+        # self.indices = data.identifiers
+        self.indices = getattr(data, "identifiers", None)
+        if self.indices is None:
+            self.indices = list(data.keys())
+        if not self.indices:
+            if hasattr(data, "keys"):
+                self.indices = list(data.keys())
+            else:
+                self.indices = list(getattr(data, "_keys", []))
+
+        if not self.indices:
+            raise RuntimeError(
+                "No training identifiers found. Check that splits_final.json matches the preprocessed cases "
+                "and that the dataset exposes identifiers/keys."
+            )
 
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
@@ -65,6 +79,43 @@ class nnUNetDataLoader(DataLoader):
         self.get_do_oversample = self._oversample_last_XX_percent if not probabilistic_oversampling \
             else self._probabilistic_oversampling
         self.transforms = transforms
+    def _load_case_compat(self, ds, case_id):
+        """
+        Return (data, seg, seg_prev, properties) from ds for case_id,
+        working across forks that may not implement .load_case.
+        """
+        # native API
+        if hasattr(ds, "load_case"):
+            return ds.load_case(case_id)
+
+        # fallback: dict/tuple interface
+        item = None
+        if hasattr(ds, "__getitem__"):
+            try:
+                item = ds[case_id]
+            except Exception:
+                item = None
+        if item is None and hasattr(ds, "get_case"):
+            item = ds.get_case(case_id)
+        if item is None:
+            raise AttributeError("Dataset has neither load_case nor compatible item access")
+
+        # normalize formats
+        if isinstance(item, dict):
+            data = item.get("data")
+            seg = item.get("seg")
+            seg_prev = item.get("seg_prev") or item.get("seg_from_prev_stage")
+            properties = item.get("properties")
+            return data, seg, seg_prev, properties
+
+        if isinstance(item, (list, tuple)):
+            if len(item) == 3:
+                data, seg, properties = item
+                return data, seg, None, properties
+            if len(item) == 4:
+                return item  # (data, seg, seg_prev, properties)
+
+        raise TypeError("Unknown dataset item format")
 
     def _oversample_last_XX_percent(self, sample_idx: int) -> bool:
         """
@@ -76,11 +127,43 @@ class nnUNetDataLoader(DataLoader):
         # print('YEAH BOIIIIII')
         return np.random.uniform() < self.oversample_foreground_percent
 
+    # def determine_shapes(self):
+    #     # load one case
+    #     # data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
+    #     # new
+    #     case_id = self.indices[0]
+    #     if hasattr(self._data, "load_case"):
+    #         data, seg, seg_prev, properties = self._data.load_case(case_id)
+    #     else:
+    #         # fallback: dataset acts like dict
+    #         item = self._data[case_id] if hasattr(self._data, "__getitem__") else self._data.get_case(case_id)
+    #         if isinstance(item, dict):
+    #             data = item.get("data")
+    #             seg = item.get("seg")
+    #             seg_prev = item.get("seg_prev") or item.get("seg_from_prev_stage")
+    #             properties = item.get("properties")
+    #         else:  # assume tuple
+    #             if len(item) == 3:
+    #                 data, seg, properties = item
+    #                 seg_prev = None
+    #             elif len(item) == 4:
+    #                 data, seg, seg_prev, properties = item
+    #             else:
+    #                 raise TypeError("Unknown dataset item format")
+    #     num_color_channels = data.shape[0]
+
+    #     data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+    #     channels_seg = seg.shape[0]
+    #     if seg_prev is not None:
+    #         channels_seg += 1
+    #     seg_shape = (self.batch_size, channels_seg, *self.patch_size)
+    #     return data_shape, seg_shape
     def determine_shapes(self):
         # load one case
-        data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
-        num_color_channels = data.shape[0]
+        case_id = self.indices[0]
+        data, seg, seg_prev, properties = self._load_case_compat(self._data, case_id)
 
+        num_color_channels = data.shape[0]
         data_shape = (self.batch_size, num_color_channels, *self.patch_size)
         channels_seg = seg.shape[0]
         if seg_prev is not None:
@@ -163,38 +246,59 @@ class nnUNetDataLoader(DataLoader):
         bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
 
         return bbox_lbs, bbox_ubs
-
+    
     def generate_train_batch(self):
+        import re
         selected_keys = self.get_indices()
-        # preallocate memory for data and seg
+
+        # preallocate
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
-        for j, i in enumerate(selected_keys):
-            # oversampling foreground will improve stability of model training, especially if many patches are empty
-            # (Lung for example)
+        # helper to parse subtype from key/path
+        def _infer_subtype_from_key(k: str) -> int:
+            # pattern like quiz_0_041 -> grabs the '0'
+            m = re.search(r'quiz_(\d)_\d+', k)
+            if m:
+                return int(m.group(1))
+            # or folder name contains subtype0/1/2
+            m = re.search(r'subtype\s*([0-2])', k)
+            if m:
+                return int(m.group(1))
+            return -1  # unknown / ignore
+
+        class_targets_list = []
+
+        for j, case_id in enumerate(selected_keys):
+            # oversampling foreground improves stability
             force_fg = self.get_do_oversample(j)
 
-            data, seg, seg_prev, properties = self._data.load_case(i)
-
-            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
-            # self._data.load_case(i) (see nnUNetDataset.load_case)
+            data, seg, seg_prev, properties = self._load_case_compat(self._data, case_id)
             shape = data.shape[1:]
 
-            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            # properties['class_locations'] may be missing on some forks
+            class_locs = None
+            if isinstance(properties, dict):
+                class_locs = properties.get('class_locations', None)
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, class_locs)
             bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
-            # use ACVL utils for that. Cleaner.
+            # crop/pad
             data_all[j] = crop_and_pad_nd(data, bbox, 0)
-
             seg_cropped = crop_and_pad_nd(seg, bbox, -1)
             if seg_prev is not None:
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
 
+            # collect classification target (0/1/2)
+            class_targets_list.append(_infer_subtype_from_key(str(case_id)))
+
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
+
+        class_targets = torch.as_tensor(class_targets_list, dtype=torch.long)
 
         if self.transforms is not None:
             with torch.no_grad():
@@ -213,9 +317,85 @@ class nnUNetDataLoader(DataLoader):
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            return {'data': data_all, 'target': seg_all, 'classTarget': class_targets, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        return {'data': torch.from_numpy(data_all).float(),
+                'target': torch.from_numpy(seg_all).to(torch.int16),
+                'classTarget': class_targets,
+                'keys': selected_keys}
+
+    # def generate_train_batch(self):
+    #     selected_keys = self.get_indices()
+    #     # preallocate memory for data and seg
+    #     data_all = np.zeros(self.data_shape, dtype=np.float32)
+    #     seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+    #     for j, i in enumerate(selected_keys):
+    #         # oversampling foreground will improve stability of model training, especially if many patches are empty
+    #         # (Lung for example)
+    #         force_fg = self.get_do_oversample(j)
+
+    #         # data, seg, seg_prev, properties = self._data.load_case(i)
+    #         # new
+    #         case_id = self.indices[0]
+    #         if hasattr(self._data, "load_case"):
+    #             data, seg, seg_prev, properties = self._data.load_case(case_id)
+    #         else:
+    #             # fallback: dataset acts like dict
+    #             item = self._data[case_id] if hasattr(self._data, "__getitem__") else self._data.get_case(case_id)
+    #             if isinstance(item, dict):
+    #                 data = item.get("data")
+    #                 seg = item.get("seg")
+    #                 seg_prev = item.get("seg_prev") or item.get("seg_from_prev_stage")
+    #                 properties = item.get("properties")
+    #             else:  # assume tuple
+    #                 if len(item) == 3:
+    #                     data, seg, properties = item
+    #                     seg_prev = None
+    #                 elif len(item) == 4:
+    #                     data, seg, seg_prev, properties = item
+    #                 else:
+    #                     raise TypeError("Unknown dataset item format")
+
+    #         # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+    #         # self._data.load_case(i) (see nnUNetDataset.load_case)
+    #         shape = data.shape[1:]
+
+    #         bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+    #         bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+    #         # use ACVL utils for that. Cleaner.
+    #         data_all[j] = crop_and_pad_nd(data, bbox, 0)
+
+    #         seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+    #         if seg_prev is not None:
+    #             seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+    #         seg_all[j] = seg_cropped
+
+    #     if self.patch_size_was_2d:
+    #         data_all = data_all[:, :, 0]
+    #         seg_all = seg_all[:, :, 0]
+
+    #     if self.transforms is not None:
+    #         with torch.no_grad():
+    #             with threadpool_limits(limits=1, user_api=None):
+    #                 data_all = torch.from_numpy(data_all).float()
+    #                 seg_all = torch.from_numpy(seg_all).to(torch.int16)
+    #                 images = []
+    #                 segs = []
+    #                 for b in range(self.batch_size):
+    #                     tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+    #                     images.append(tmp['image'])
+    #                     segs.append(tmp['segmentation'])
+    #                 data_all = torch.stack(images)
+    #                 if isinstance(segs[0], list):
+    #                     seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+    #                 else:
+    #                     seg_all = torch.stack(segs)
+    #                 del segs, images
+    #         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
+    #     return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
 if __name__ == '__main__':
